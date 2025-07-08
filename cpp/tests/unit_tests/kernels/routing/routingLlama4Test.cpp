@@ -138,7 +138,7 @@ TYPED_TEST_SUITE(RoutingLlama4KernelTest, Bf16Types);
 TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/3,
-        /*numExperts=*/128, /*topK=*/1,
+        /*numExperts=*/128, /*topK=*/1, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
@@ -149,7 +149,7 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
 TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/100,
-        /*numExperts=*/128, /*topK=*/1,
+        /*numExperts=*/128, /*topK=*/1, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
@@ -160,7 +160,7 @@ TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/300,
-        /*numExperts=*/128, /*topK=*/1,
+        /*numExperts=*/128, /*topK=*/1, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,

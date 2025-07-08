@@ -51,6 +51,7 @@ private:
 
     void computeTopKExperts(RoutingKernelTestParam const& param) override
     {
+        int const totalExpertsPerToken = param.topK + param.numFusedSharedExperts;
         // note that for invalid scores, we simply use a negative value:
         // they work well even with the compacted format used in topK, and
         // sigmoid / bias activated scores cannot be negative
@@ -132,11 +133,17 @@ private:
                 expIdxHostPtr[it * param.topK + ie] = static_cast<int32_t>(finalTopkExperts[ie].idx);
                 if (param.getExpWeights)
                 {
-                    bufferCast<T>(*this->mPtrExpertWeightsHost)[it * param.topK + ie]
+                    bufferCast<T>(*this->mPtrExpertWeightsHost)[it * totalExpertsPerToken + ie]
                         = static_cast<T>(finalTopkExperts[ie].score);
                 }
                 PackedType si{static_cast<T>(finalTopkExperts[ie].score), finalTopkExperts[ie].idx};
                 reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrExpertIdxHost))[it * param.topK + ie] = si;
+            }
+            // Write the shared expert scores
+            for (int sharedExpertIdx = 0; sharedExpertIdx < param.numFusedSharedExperts; sharedExpertIdx++)
+            {
+                bufferCast<T>(*this->mPtrExpertWeightsHost)[it * totalExpertsPerToken + param.topK + sharedExpertIdx]
+                    = static_cast<T>(1.0f);
             }
         }
     }
@@ -180,6 +187,11 @@ private:
         //@todo: remove this line after refactoring
         routingData.mPtrExpertIdx = bufferCast<int32_t>(*this->mPtrDeepseekExpertIdxDevice);
 
+        routingData.mNumFusedSharedExperts = param.numFusedSharedExperts;
+        routingData.mSharedExpertTokenOffset = param.sharedExpertTokenOffset;
+        routingData.mSharedExpertNumTokens = param.sharedExpertNumTokens;
+        routingData.mTotalExpertsPerToken = routingData.mTopK + routingData.mNumFusedSharedExperts;
+
         routingData.mNumExpertGroups = param.nGroup;
         routingData.mNumLimitedGroups = param.topkGroup;
         routingData.mRouteScale = param.routedScalingFactor;
@@ -211,6 +223,8 @@ private:
         int32_t* expIdxToPermHostptr = bufferCast<int32_t>(*this->mPtrExpandedIdxToPermutedIdxHost);
         int32_t* expIdxHostPtr = bufferCast<int32_t>(*this->mPtrDeepseekExpertIdxHost);
 
+        int const totalExpertsPerToken = param.topK + param.numFusedSharedExperts;
+
         for (int ie = 0; ie < param.numExperts; ++ie)
         {
             std::set<int32_t> permutedIdx, permutedIdxTest;
@@ -219,27 +233,51 @@ private:
             auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
                 && (localExpertIdx & param.localExpertsStrideLog2) == 0;
 
-            for (int it = 0; it < param.numTokens * param.topK; ++it)
+            // Loop over expanded indices
+            for (int it = 0; it < param.numTokens; ++it)
             {
-                if (expIdxHostPtr[it] == ie)
+                for (int k = 0; k < param.topK; k++)
                 {
-                    int const permIdx = isLocalExpert ? expIdxToPermHostptr[it] : int32_t{-1};
-                    permutedIdx.insert(permIdx);
-                    if (isLocalExpert)
+                    int const routedExpandedIdx = it * param.topK + k;
+                    int const expandedIdx = it * totalExpertsPerToken + k;
+                    if (expIdxHostPtr[routedExpandedIdx] == ie)
                     {
-                        tokenIdx.insert(it / param.topK);
-                    }
+                        int const permIdx = isLocalExpert ? expIdxToPermHostptr[expandedIdx] : int32_t{-1};
+                        permutedIdx.insert(permIdx);
+                        if (isLocalExpert)
+                        {
+                            tokenIdx.insert(it);
+                        }
 
-                    int const permIdxTest = hostExpToPermTest[it];
-                    permutedIdxTest.insert(permIdxTest);
-                    if (isLocalExpert)
-                    {
-                        tokenIdxTest.insert(hostPermToTokTest[permIdxTest]);
+                        int const permIdxTest = hostExpToPermTest[expandedIdx];
+                        permutedIdxTest.insert(permIdxTest);
+                        if (isLocalExpert)
+                        {
+                            tokenIdxTest.insert(hostPermToTokTest[permIdxTest]);
+                        }
                     }
                 }
             }
             EXPECT_EQ(checkSetEqual(ie, permutedIdx, permutedIdxTest, "permuted idx"), true);
             EXPECT_EQ(checkSetEqual(ie, tokenIdx, tokenIdxTest, "token idx"), true);
+        }
+        // Verify the shared experts (shared expert mapping is deterministic)
+        for (int sharedExpertIdx = 0; sharedExpertIdx < param.numFusedSharedExperts; ++sharedExpertIdx)
+        {
+            for (int it = 0; it < param.numTokens; ++it)
+            {
+                int const localTokenIdx = it - param.sharedExpertTokenOffset;
+                bool const isLocal = (localTokenIdx >= 0) && (localTokenIdx < param.sharedExpertNumTokens);
+                int const expandedIdx = it * totalExpertsPerToken + param.topK + sharedExpertIdx;
+                int const permutedIdx = expIdxToPermHostptr[expandedIdx];
+                int const permutedIdxTest = hostExpToPermTest[expandedIdx];
+                EXPECT_EQ(permutedIdx, permutedIdxTest);
+                if (isLocal)
+                {
+                    int const tokenIdxTest = hostPermToTokTest[permutedIdxTest];
+                    EXPECT_EQ(tokenIdxTest, it);
+                }
+            }
         }
     }
 };
@@ -249,7 +287,7 @@ TYPED_TEST_SUITE(RoutingDeepSeekKernelTest, Bf16Types);
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/10,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
@@ -260,7 +298,40 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/100,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithFusedShared)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/10,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 2,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithEPAndFSDevice0)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/9,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 2,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithEPAndFSDevice1)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/9,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 2,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
@@ -271,8 +342,30 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParal
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationWithFusedShared)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 2,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationWithExpertParallelizationAndFusedShared)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/8030,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 1,
+        /*expertParallelization=*/4, /*expertParallelizationId=*/2,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);

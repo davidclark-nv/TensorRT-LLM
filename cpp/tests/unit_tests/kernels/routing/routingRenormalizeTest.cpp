@@ -182,7 +182,7 @@ TYPED_TEST_SUITE(RoutingRenormalizeKernelTest, FloatAndBf16Types);
 TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/10,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
@@ -193,7 +193,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelization)
 TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithExpertParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/100,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
@@ -204,7 +204,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithExpertPa
 TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormalizeNaive)
 {
     RoutingKernelTestParam param(RoutingMethodType::RenormalizeNaive, /*numTokens=*/10,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,
@@ -215,7 +215,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormal
 TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/300,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,

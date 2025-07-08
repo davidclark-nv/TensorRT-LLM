@@ -207,6 +207,13 @@ struct RoutingKernelTestParam
     int32_t numTokens;
     int32_t numExperts;
     uint32_t topK{1};
+    // Number of shared experts fused into routed experts (only supported for DeepSeek)
+    int32_t numFusedSharedExperts{0};
+    // Number of tokens routed to the shared experts, when expert parallelism is being used each token will only be
+    // routed to a shared expert on a single GPU.
+    int32_t sharedExpertNumTokens{0};
+    // Offset for tokens routed to shared expert on this device
+    int32_t sharedExpertTokenOffset{0};
 
     int32_t localExpertsStartIdx{0};
     int32_t localExpertsStrideLog2{0};
@@ -241,13 +248,14 @@ struct RoutingKernelTestParam
 
     // Constructor with all parameters
     RoutingKernelTestParam(RoutingMethodType routingMethod, int32_t numTokens, int32_t numExperts, uint32_t topK,
-        int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t paddingLog2 = 3,
-        int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true, int32_t nGroup = 1,
-        int32_t topkGroup = 1, float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
+        int32_t numFusedSharedExperts, int32_t expertParallelization = 1, int32_t expertParallelizationId = 0,
+        int32_t paddingLog2 = 3, int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true,
+        int32_t nGroup = 1, int32_t topkGroup = 1, float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
         : routingMethod(routingMethod)
         , numTokens(numTokens)
         , numExperts(numExperts)
         , topK(topK)
+        , numFusedSharedExperts(numFusedSharedExperts)
         , paddingLog2(paddingLog2)
         , localExpertsStrideLog2(localExpertsStrideLog2)
         , usePdl(usePdl)
@@ -267,6 +275,20 @@ struct RoutingKernelTestParam
         // Set about the expert parallelization
         numLocalExperts = numExperts / expertParallelization;
         localExpertsStartIdx = numLocalExperts * expertParallelizationId;
+
+        // Set shared expert parallelism
+        int const baseTokensPerDevice = numTokens / expertParallelization;
+        int const remainingTokens = numTokens % expertParallelization;
+        if (expertParallelizationId < remainingTokens)
+        {
+            sharedExpertTokenOffset = (baseTokensPerDevice + 1) * expertParallelizationId;
+            sharedExpertNumTokens = baseTokensPerDevice + 1;
+        }
+        else
+        {
+            sharedExpertTokenOffset = remainingTokens + expertParallelizationId * baseTokensPerDevice;
+            sharedExpertNumTokens = baseTokensPerDevice;
+        }
 
         // Apply routing method specific settings
         if (routingMethod == RoutingMethodType::RenormalizeNaive)
