@@ -1439,7 +1439,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             # Assert should only be removed during debugging
             assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
             # Interleave the weight.
-            processed_w3_w1_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            processed_w3_w1_weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
                 w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape))
             # Copy the result into device buffer
             dst_w3_w1_weight_scale.copy_(
@@ -1469,7 +1469,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                 dst_w2_weight_scale.view(dtype=float4_sf_dtype),
                 permute_indices)
             # Interleave the weight.
-            processed_w2_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            processed_w2_weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
                 w_shuffled)
             # Copy the result into device buffer
             dst_w2_weight_scale.copy_(
@@ -1489,7 +1489,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             module.w2_weight.shape[2]).permute(1, 0, 2).contiguous()
 
         w1_w3_weight_scale = shared_experts.gate_up_proj.weight_scale.data
-        w1_w3_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+        w1_w3_weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
             w1_w3_weight_scale.cpu().view(
                 -1, module.w3_w1_weight_scale.shape[-1])).view(
                     torch.float8_e4m3fn).cuda()
@@ -1502,7 +1502,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             module.w3_w1_weight_scale.shape[2])
 
         w2_weight_scale = shared_experts.down_proj.weight_scale.data
-        w2_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+        w2_weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
             w2_weight_scale.cpu().view(-1,
                                        module.w2_weight_scale.shape[-1])).view(
                                            torch.float8_e4m3fn).cuda()

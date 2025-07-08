@@ -697,11 +697,11 @@ class TestMoeFP8:
             padding,
             num_fused_shared_experts=num_fused_shared_experts)
 
-        args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
-                        total_experts_per_token, padding, hidden_states,
-                        hidden_states_scale, None, scores, gemm1_weights,
-                        gemm1_scales, None, gemm2_weights, gemm2_scales, None,
-                        permute_info, False)
+        args = moe_args(num_tokens, num_experts_total, hidden_size,
+                        intermediate_size, total_experts_per_token, padding,
+                        hidden_states, hidden_states_scale, None, scores,
+                        gemm1_weights, gemm1_scales, None, gemm2_weights,
+                        gemm2_scales, None, permute_info, False)
 
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_block_scale_moe_runner(
