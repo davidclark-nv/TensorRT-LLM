@@ -70,7 +70,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
-        moe::dev::routing::Data routingData;
+        moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
@@ -126,7 +126,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
             routingData.mSharedExpertNumTokens = baseTokensPerDevice;
         }
 
-        moe::dev::routing::run(routingData, stream);
+        moe::dev::routing::routingDeepSeek::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Llama4)
     {
@@ -136,7 +136,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         {
             TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
         }
-        moe::dev::routingLlama4::Data routingData;
+        moe::dev::routing::routingLlama4::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
@@ -172,13 +172,14 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLocalExperts = localNumExperts;
         // routingData.mRouteScale = routed_scaling_factor;
         // routingData.mUseRoutingSoftmax = false;
-        moe::dev::routingLlama4::run(routingData, stream);
+        moe::dev::routing::routingLlama4::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
         || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
-        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0, "Renormalize routing method does not support fusing shared expert");
-        moe::dev::routingRenormalize::Data routingData;
+        TLLM_CHECK_WITH_INFO(
+            numFusedSharedExpert == 0, "Renormalize routing method does not support fusing shared expert");
+        moe::dev::routing::routingRenormalize::Data routingData;
 
         //
         // Config
@@ -220,7 +221,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
 
-        moe::dev::routingRenormalize::run(routingData, stream);
+        moe::dev::routing::routingRenormalize::run(routingData, stream);
     }
     else
     {
