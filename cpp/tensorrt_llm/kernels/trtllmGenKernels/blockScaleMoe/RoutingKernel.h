@@ -31,34 +31,21 @@ namespace routing
 
 namespace tg = batchedGemm::trtllm::gen;
 
-template <typename TypeExpW>
+template <typename DataType>
 struct PackedScoreIdx
 {
-    TypeExpW score;
-    int16_t idx; // @TODO: Might use int8_t as the number of experts is 128
+    DataType score;
+    int16_t idx;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace routingDeepSeek
+struct DataBase
 {
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-struct Data
-{
-    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
     bool mUsePdl{false};
 
-    // note: at least one of the optional outputs below must be provided
-    // note: if one of the indexes using "PermutedIdx" is provided,
-    // then `mPtrExpertIdx` and `mPtrPermutedIdxSize` must be provided
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens, mTopK]
-    int32_t* mPtrExpertIdx{nullptr};
-
     // optional: only used as an intermediate buffer when the number of tokens is large.
-    // dim: [2*NumThreads] = [512]
+    // dim: max([2*NumThreads] = [512], mNumExperts*2)
     int32_t* mPtrExpertCounts{nullptr};
 
     // optional: if `nullptr`, it is not filled
@@ -71,15 +58,26 @@ struct Data
 
     // optional: if `nullptr`, it is not filled
     // dim: [mNumTokens * mTotalExpertsPerToken + (mNumExperts << mPaddingLog2) - mNumExperts]
+    // Note: this array (mPtrPermutedIdxToTokenIdx) is uninitialized
+    // Any out-of-bounds values are undefined.
     int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
-
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumLocalExperts * (2 ^ mLocalExpertsStrideLog2), mNumTokens]
-    void* mPtrExpertWeightsFull{nullptr};
 
     // optional: if `nullptr`, it is not filled
     // dim: [mNumTokens, mTotalExpertsPerToken]
     void* mPtrExpertWeights{nullptr};
+    // optional: if `nullptr`, scores are used directly as input.
+    // If it is given, it must represent a packed value s.t. the most significant
+    // 16/32 bits represent the score without sigmoid activation and
+    // the least significant 16 bits represent the index of the chosen expert (unsigned).
+    // note: this is required if the number of tokens is large.
+    // dim: [mNumTokens, mTopK]
+    void* mPtrExpertIdx{nullptr};
+    // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
+    // If it is given, it represents the scores without sigmoid activation for
+    // each token and expert.
+    // note: if it is provided, we always re-compute the top1 scores
+    // dim: [mNumTokens, mNumExperts]
+    void const* mPtrScores{nullptr};
 
     //
     // Grouped Gemm Launch Config Buffers
@@ -87,27 +85,31 @@ struct Data
     int32_t* mPtrCtaIdxXyToBatchIdx{nullptr};
     int32_t* mPtrCtaIdxXyToMnLimit{nullptr};
     int32_t* mPtrNumNonExitingCtas{nullptr};
-    // mPtrPermutedIdxSize is ptrTotalNumPaddedTokens
-    bool mAllToAllRouteAct{false};
 
-    void const* mPtrRoutingWeights;
-    void const* mPtrRoutingBias;
-    void const* mPtrIn;
-    float* mPtrScores;
-
+    //
+    // Metadata
+    //
     int32_t mNumTokens;
-    int32_t mHiddenDim;
-
     // The number of routed experts
     int32_t mNumExperts;
     // The number of shared experts to fuse into batched gemm
     int32_t mNumFusedSharedExperts;
-    // The number of routed experts on this device
-    int32_t mNumLocalExperts;
+
+    // The number of routed experts per token
+    int32_t mTopK;
+    // The total number of experts per token (potentially including fused shared expert)
+    int32_t mTotalExpertsPerToken;
+    int32_t mPaddingLog2;
+
+    // For expert parallelization
+    //
     // The starting index of this devices local experts
     int32_t mLocalExpertsStartIdx;
     // The log2 of the stride between experts on this device
     int32_t mLocalExpertsStrideLog2;
+    // The number of routed experts on this device
+    int32_t mNumLocalExperts;
+
     // The token offset for shared expert
     //
     // When using expert parallelism with a fused shared expert, all devices will include the shared expect; however,
@@ -116,113 +118,134 @@ struct Data
     int32_t mSharedExpertTokenOffset;
     // The number of tokens for shared expert on this device
     int32_t mSharedExpertNumTokens;
-    // The number of routed experts per token
-    int32_t mTopK;
-    // The total number of experts per token (potentially including fused shared expert)
-    int32_t mTotalExpertsPerToken;
-    // The number of expert groups
+};
+
+template <typename InputT_, typename OutputT_, bool UsePdl_>
+struct KernelParamsBase
+{
+    using InputT = InputT_;
+    using OutputT = OutputT_;
+    static constexpr bool UsePdl = UsePdl_;
+
+    // Public pointer members
+    int32_t* mPtrExpertCounts = nullptr;
+    int32_t* mPtrPermutedIdxSize = nullptr;
+    int32_t* mPtrExpandedIdxToPermutedIdx = nullptr;
+    int32_t* mPtrPermutedIdxToTokenIdx = nullptr;
+    int32_t* mPtrCtaIdxXyToBatchIdx = nullptr;
+    int32_t* mPtrCtaIdxXyToMnLimit = nullptr;
+    int32_t* mPtrNumNonExitingCtas = nullptr;
+    OutputT* mPtrExpertWeights = nullptr;
+    InputT const* mPtrScores = nullptr;
+
+    // Public scalar members
+    int32_t mNumTokens = 0;
+    int32_t mNumExperts = 0;
+
+    int32_t mPaddingLog2 = 0;
+    int32_t mLocalExpertsStartIdx = 0;
+    int32_t mLocalExpertsStrideLog2 = 0;
+    int32_t mNumLocalExperts = 0;
+
+    int32_t mTotalExpertsPerToken = 0;
+    int32_t mNumFusedSharedExperts = 0;
+    int32_t mSharedExpertTokenOffset = 0;
+    int32_t mSharedExpertNumTokens = 0;
+
+    // Public initialization function - make it a template to accept different Data types
+    template <typename DataType>
+    void setBaseParams(DataType const& data)
+    {
+        mPtrExpertCounts = data.mPtrExpertCounts;
+        mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
+        mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
+        mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
+        mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
+        mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
+        mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
+        mPtrExpertWeights = static_cast<OutputT*>(data.mPtrExpertWeights);
+        mPtrScores = (InputT const*) data.mPtrScores;
+
+        mNumTokens = data.mNumTokens;
+        mNumExperts = data.mNumExperts;
+
+        mPaddingLog2 = data.mPaddingLog2;
+        mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
+        mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
+        mNumLocalExperts = data.mNumLocalExperts;
+
+        mTotalExpertsPerToken = data.mTotalExpertsPerToken;
+        mNumFusedSharedExperts = data.mNumFusedSharedExperts;
+        mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
+        mSharedExpertNumTokens = data.mSharedExpertNumTokens;
+    }
+};
+
+namespace routingDeepSeek
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+struct Data : public DataBase
+{
+    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+
+    //
+    // Grouped Gemm Launch Config Buffers
+    //
+    void const* mPtrRoutingBias;
+
+    int32_t mHiddenDim; // not used
     int32_t mNumExpertGroups;
-    // The number of groups selected
     int32_t mNumLimitedGroups;
-    // The log2 of the padding in the permuted buffer
-    int32_t mPaddingLog2;
 
     float mRouteScale;
     bool mUseRoutingSoftmax;
-
-    int32_t* mPtrNumTokensPerExpert{nullptr};
-    int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
 };
 
-template <typename TypeExpW_, bool UseGroups_, bool UsePdl_>
-struct KernelParams
+template <typename InputT_, typename OutputT_, bool UseGroups_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_>
 {
-    using TypeExpW = TypeExpW_;
+    using InputT = InputT_;
+    using OutputT = OutputT_;
+
     static constexpr bool UseGroups = UseGroups_;
-    static constexpr bool UsePdl = UsePdl_;
 
-    int32_t* mPtrExpertIdx;
-    int32_t* mPtrExpertCounts;
-    int32_t* mPtrPermutedIdxSize;
-    int32_t* mPtrExpandedIdxToPermutedIdx;
-    int32_t* mPtrPermutedIdxToTokenIdx;
-    int32_t* mPtrPermutedIdxToExpandedIdx;
-    int32_t* mPtrNumTokensPerExpert;
+    PackedScoreIdx<OutputT>* mPtrExpertIdx = nullptr;
 
-    int32_t* mPtrCtaIdxXyToBatchIdx;
-    int32_t* mPtrCtaIdxXyToMnLimit;
-    int32_t* mPtrNumNonExitingCtas;
+    // OutputT* mPtrExpertWeightsFull = nullptr;
+    // Note: this variable(mPtrExpertWeightsFull) might need to be added back for the low-latency kernels for MoE in
+    // tllm-gen in the future
 
-    TypeExpW* mPtrExpertWeightsFull;
-    TypeExpW* mPtrExpertWeights;
-    TypeExpW const* mPtrRoutingWeights;
-    TypeExpW const* mPtrRoutingBias;
-    float const* mPtrScores;
+    OutputT const* mPtrRoutingBias = nullptr;
 
-    int32_t mNumTokens;
-    int32_t mHiddenDim;
+    int32_t mNumExpertGroups = 0;
+    int32_t mNumExpertsPerGroup = 0;
+    int32_t mNumLimitedGroups = 0;
 
-    int32_t mNumExperts;
-    int32_t mNumFusedSharedExperts;
-    int32_t mNumLocalExperts;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
-    int32_t mSharedExpertTokenOffset;
-    int32_t mSharedExpertNumTokens;
     trtllm::dev::IntFastDiv mTopK;
-    int32_t mTotalExpertsPerToken;
-    int32_t mNumExpertGroups;
-    int32_t mNumExpertsPerGroup;
-    int32_t mNumLimitedGroups;
-    int32_t mPaddingLog2;
-    float mRouteScale;
-    bool mAllToAllRouteAct;
+    float mRouteScale = 0.f;
 
     static KernelParams setKernelParams(Data const& data)
     {
         KernelParams params;
+        params.setBaseParams(data);
 
-        params.mPtrExpertIdx = data.mPtrExpertIdx;
-        params.mPtrExpertCounts = data.mPtrExpertCounts;
-        params.mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
-        params.mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
-        params.mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
-        params.mPtrPermutedIdxToExpandedIdx = data.mPtrPermutedIdxToExpandedIdx;
-        params.mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
+        params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*) data.mPtrExpertIdx;
 
-        params.mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
-        params.mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
-        params.mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
+        // params.mPtrExpertWeightsFull = static_cast<OutputT*>(data.mPtrExpertWeightsFull);
+        params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
 
-        params.mPtrExpertWeightsFull = (TypeExpW*) data.mPtrExpertWeightsFull;
-        params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
-        params.mPtrRoutingWeights = (TypeExpW*) data.mPtrRoutingWeights;
-        params.mPtrRoutingBias = (TypeExpW*) data.mPtrRoutingBias;
-        params.mPtrScores = data.mPtrScores;
-
-        params.mHiddenDim = data.mHiddenDim;
-        params.mNumTokens = data.mNumTokens;
-
-        params.mNumExperts = data.mNumExperts;
-        params.mNumFusedSharedExperts = data.mNumFusedSharedExperts;
-        params.mNumLocalExperts = data.mNumLocalExperts;
-        params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
-        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
-        params.mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
-        params.mSharedExpertNumTokens = data.mSharedExpertNumTokens;
-        params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
-        params.mTotalExpertsPerToken = data.mTotalExpertsPerToken;
         params.mNumExpertGroups = data.mNumExpertGroups;
         params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
         params.mNumLimitedGroups = data.mNumLimitedGroups;
-        params.mPaddingLog2 = data.mPaddingLog2;
+        params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
         params.mRouteScale = data.mRouteScale;
-        params.mAllToAllRouteAct = data.mAllToAllRouteAct;
+
         return params;
     }
 };
 
-void run(Data const& data, void* stream);
+void run(Data& data, void* stream);
 
 } // namespace routingDeepSeek
 
@@ -233,102 +256,28 @@ namespace routingLlama4
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Data
+struct Data : public DataBase
 {
     tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
-    bool mUsePdl{false};
-
-    // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
-    // If it is given, it represents the scores without sigmoid activation for
-    // each token and expert.
-    // note: if it is provided, we always re-compute the top1 scores
-    // dim: [mNumTokens, mNumExperts]
-    void const* mPtrScores{nullptr};
-    // optional: if `nullptr`, scores are used directly as input.
-    // If it is given, it must represent a packed value s.t. the most significant
-    // 16/32 bits represent the score without sigmoid activation and
-    // the least significant 16 bits represent the index of the chosen expert (unsigned).
-    // note: this is required if the number of tokens is large.
-    // dim: [mNumTokens, mTopK]
-    void* mPtrExpertIdx{nullptr};
-
-    // note: at least one of the optional outputs below must be provided
-    // optional: only used as an intermediate buffer when the number of tokens is large.
-    // dim: [2, mNumExperts]
-    int32_t* mPtrExpertCounts{nullptr};
-    // dim: [1]
-    int32_t* mPtrPermutedIdxSize{nullptr};
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens * mTopK]
-    int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
-    int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens, mTopK]
-    void* mPtrExpertWeights{nullptr};
-    //
-    // Grouped Gemm Launch Config Buffers
-    //
-    int32_t* mPtrCtaIdxXyToBatchIdx{nullptr};
-    int32_t* mPtrCtaIdxXyToMnLimit{nullptr};
-    int32_t* mPtrNumNonExitingCtas{nullptr};
-
-    int32_t mNumTokens;
-    int32_t mNumExperts;
-    int32_t mTopK;
-    int32_t mPaddingLog2;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
-    int32_t mNumLocalExperts;
 };
 
-template <typename TypeExpW_, bool UsePdl_>
-struct KernelParams
+template <typename InputT_, typename OutputT_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_>
 {
-    using TypeExpW = TypeExpW_;
-    static constexpr bool UsePdl = UsePdl_;
+    using InputT = InputT_;
+    using OutputT = OutputT_;
 
-    PackedScoreIdx<TypeExpW>* mPtrExpertIdx;
-    TypeExpW const* mPtrScores;
-    int32_t* mPtrExpertCounts;
-    int32_t* mPtrPermutedIdxSize;
-    int32_t* mPtrExpandedIdxToPermutedIdx;
-    int32_t* mPtrPermutedIdxToTokenIdx;
-    int32_t* mPtrCtaIdxXyToBatchIdx;
-    int32_t* mPtrCtaIdxXyToMnLimit;
-    int32_t* mPtrNumNonExitingCtas;
-    TypeExpW* mPtrExpertWeights;
+    PackedScoreIdx<OutputT>* mPtrExpertIdx = nullptr;
 
-    int32_t mNumTokens;
-    int32_t mNumExperts;
-    int32_t mPaddingLog2;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
-    int32_t mNumLocalExperts;
+    int32_t mTopK;
 
     static KernelParams setKernelParams(Data const& data)
     {
         KernelParams params;
+        params.setBaseParams(data);
 
-        params.mPtrExpertIdx = (PackedScoreIdx<TypeExpW>*) data.mPtrExpertIdx;
-        params.mPtrScores = (TypeExpW const*) data.mPtrScores;
-        params.mPtrExpertCounts = data.mPtrExpertCounts;
-        params.mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
-        params.mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
-        params.mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
-        params.mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
-        params.mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
-        params.mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
-        params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
-
-        params.mNumTokens = data.mNumTokens;
-        params.mNumExperts = data.mNumExperts;
-        params.mPaddingLog2 = data.mPaddingLog2;
-        params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
-        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
-        params.mNumLocalExperts = data.mNumLocalExperts;
-
+        params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*) data.mPtrExpertIdx;
+        params.mTopK = data.mTopK;
         return params;
     }
 };
@@ -344,105 +293,37 @@ namespace routingRenormalize
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Data
+struct Data : public DataBase
 {
     tg::Dtype mDtypeExpW{tg::Dtype::Fp32};
     tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
-    bool mUsePdl{false};
+
     bool mDoSoftmaxBeforeTopK{false};
     bool mNormTopkProb{true}; // Default value is true for Qwen3 model
-    // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
-    // If it is given, it represents the scores without sigmoid activation for
-    // each token and expert.
-    // note: if it is provided, we always re-compute the top1 scores
-    // dim: [mNumTokens, mNumExperts]
-    void const* mPtrScores{nullptr};
-    // optional: if `nullptr`, scores are used directly as input.
-    // If it is given, it must represent a packed value s.t. the most significant
-    // 16/32 bits represent the score without sigmoid activation and
-    // the least significant 16 bits represent the index of the chosen expert (unsigned).
-    // note: this is required if the number of tokens is large.
-    // dim: [mNumTokens, mTopK]
-    void* mPtrExpertIdx{nullptr};
-
-    // note: at least one of the optional outputs below must be provided
-    // optional: only used as an intermediate buffer when the number of tokens is large.
-    // dim: [2, mNumExperts]
-    int32_t* mPtrExpertCounts{nullptr};
-    // dim: [1]
-    int32_t* mPtrPermutedIdxSize{nullptr};
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens * mTopK]
-    int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
-    int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens, mTopK]
-    void* mPtrExpertWeights{nullptr};
-    //
-    // Grouped Gemm Launch Config Buffers
-    //
-    int32_t* mPtrCtaIdxXyToBatchIdx{nullptr};
-    int32_t* mPtrCtaIdxXyToMnLimit{nullptr};
-    int32_t* mPtrNumNonExitingCtas{nullptr};
-
-    int32_t mNumTokens;
-    int32_t mNumExperts;
-    int32_t mTopK;
-    int32_t mPaddingLog2;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
-    int32_t mNumLocalExperts;
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
-struct KernelParams
+template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_>
 {
-    using Type = Type_;
-    using TypeExpW = TypeExpW_;
-    static constexpr bool UsePdl = UsePdl_;
-    bool mNormTopkProb = true;
-    PackedScoreIdx<TypeExpW>* mPtrExpertIdx;
-    TypeExpW const* mPtrScores;
-    int32_t* mPtrExpertCounts;
-    int32_t* mPtrPermutedIdxSize;
-    int32_t* mPtrExpandedIdxToPermutedIdx;
-    int32_t* mPtrPermutedIdxToTokenIdx;
-    int32_t* mPtrCtaIdxXyToBatchIdx;
-    int32_t* mPtrCtaIdxXyToMnLimit;
-    int32_t* mPtrNumNonExitingCtas;
-    TypeExpW* mPtrExpertWeights;
+    using InputT = InputT_;
+    using OutputT = OutputT_;
 
-    int32_t mNumTokens;
-    int32_t mNumExperts;
-    int32_t mPaddingLog2;
-    int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsStrideLog2;
-    int32_t mNumLocalExperts;
+    static constexpr bool DoSoftmaxBeforeTopK = DoSoftmaxBeforeTopK_;
+
+    PackedScoreIdx<OutputT>* mPtrExpertIdx = nullptr;
+
+    int32_t mTopK = 0;
+
+    bool mNormTopkProb = true;
 
     static KernelParams setKernelParams(Data const& data)
     {
         KernelParams params;
+        params.setBaseParams(data);
+
+        params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*) data.mPtrExpertIdx;
         params.mNormTopkProb = data.mNormTopkProb;
-        params.mPtrExpertIdx = (PackedScoreIdx<TypeExpW>*) data.mPtrExpertIdx;
-        params.mPtrScores = (TypeExpW const*) data.mPtrScores;
-        params.mPtrExpertCounts = data.mPtrExpertCounts;
-        params.mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
-        params.mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
-        params.mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
-        params.mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
-        params.mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
-        params.mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
-        params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
-
-        params.mNumTokens = data.mNumTokens;
-        params.mNumExperts = data.mNumExperts;
-        params.mPaddingLog2 = data.mPaddingLog2;
-        params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
-        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
-        params.mNumLocalExperts = data.mNumLocalExperts;
-
+        params.mTopK = data.mTopK;
         return params;
     }
 };

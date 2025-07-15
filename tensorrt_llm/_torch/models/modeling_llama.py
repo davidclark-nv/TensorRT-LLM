@@ -159,8 +159,11 @@ class Llama4Attention(Attention):
             q = self._attention_scaling(q, position_ids)
 
         out_scale = None
+        out_scale_sf = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
+            out_scale_sf = self.o_proj.input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.attn.forward(q,
@@ -168,6 +171,7 @@ class Llama4Attention(Attention):
                                         v,
                                         attn_metadata,
                                         out_scale=out_scale,
+                                        out_scale_sf=out_scale_sf,
                                         attention_mask=attention_mask,
                                         mrope_config=mrope_config)
 
@@ -620,6 +624,7 @@ class Llama4Model(DecoderModel):
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
         self.mapping = model_config.mapping
+        self.preload_weight_modules = []
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
@@ -642,6 +647,7 @@ class Llama4Model(DecoderModel):
         if model_config.enable_min_latency:
             from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
             DecoderLayerClass = Llama4MinLatencyDecoderLayer
+            self.preload_weight_modules = ["gate_up_proj"]
 
         self.layers = nn.ModuleList([
             DecoderLayerClass(
@@ -874,6 +880,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         model_config.pretrained_config = model_config.pretrained_config.text_config
         model_config.pretrained_config.architectures = architectures
         super().__init__(Llama4Model(model_config), model_config)
+        self.preload_weight_modules = self.model.preload_weight_modules
 
     def forward(
         self,
@@ -891,8 +898,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 multimodal_param.multimodal_data["multimodal_embedding"]
                 for multimodal_param in multimodal_params
             ]
-            _, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                 input_ids, mm_embed)
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens, input_ids, mm_embed)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

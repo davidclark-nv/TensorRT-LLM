@@ -289,6 +289,8 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
     int32_t* expIdxToPermHostptr = bufferCast<int32_t>(*mPtrExpandedIdxToPermutedIdxHost);
     PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrExpertIdxHost));
 
+    int const totalExpertsPerToken = param.topK + param.numFusedSharedExperts;
+
     for (int ie = 0; ie < param.numExperts; ++ie)
     {
         std::set<int32_t> permutedIdx, permutedIdxTest;
@@ -296,7 +298,7 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
         auto localExpertIdx = ie - param.localExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
             && (localExpertIdx & param.localExpertsStrideLog2) == 0;
-
+#if 0
         for (int it = 0; it < param.numTokens * param.topK; ++it)
         {
             if (expIdxHostPtr[it].idx == ie)
@@ -315,8 +317,54 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
                 }
             }
         }
+#else
+        // Loop over the "routed" expanded indices, skipping any indices that would correspond to a shared expert
+        for (int it = 0; it < param.numTokens; ++it)
+        {
+            for (int k = 0; k < param.topK; k++)
+            {
+                int const routedExpandedIdx = it * param.topK + k;
+                int const expandedIdx = it * totalExpertsPerToken + k;
+                if (expIdxHostPtr[routedExpandedIdx].idx == ie)
+                {
+                    int const permIdx = isLocalExpert ? expIdxToPermHostptr[expandedIdx] : int32_t{-1};
+                    permutedIdx.insert(permIdx);
+                    if (isLocalExpert)
+                    {
+                        tokenIdx.insert(it);
+                    }
+
+                    int const permIdxTest = hostExpToPermTest[expandedIdx];
+                    permutedIdxTest.insert(permIdxTest);
+                    if (isLocalExpert)
+                    {
+                        tokenIdxTest.insert(hostPermToTokTest[permIdxTest]);
+                    }
+                }
+            }
+        }
+
+#endif
         EXPECT_EQ(checkSetEqual(ie, permutedIdx, permutedIdxTest, "permuted idx"), true);
         EXPECT_EQ(checkSetEqual(ie, tokenIdx, tokenIdxTest, "token idx"), true);
+    }
+    // Verify the shared experts (shared expert mapping is deterministic)
+    for (int sharedExpertIdx = 0; sharedExpertIdx < param.numFusedSharedExperts; ++sharedExpertIdx)
+    {
+        for (int it = 0; it < param.numTokens; ++it)
+        {
+            int const localTokenIdx = it - param.sharedExpertTokenOffset;
+            bool const isLocal = (localTokenIdx >= 0) && (localTokenIdx < param.sharedExpertNumTokens);
+            int const expandedIdx = it * totalExpertsPerToken + param.topK + sharedExpertIdx;
+            int const permutedIdx = expIdxToPermHostptr[expandedIdx];
+            int const permutedIdxTest = hostExpToPermTest[expandedIdx];
+            EXPECT_EQ(permutedIdx, permutedIdxTest);
+            if (isLocal)
+            {
+                int const tokenIdxTest = hostPermToTokTest[permutedIdxTest];
+                EXPECT_EQ(tokenIdxTest, it);
+            }
+        }
     }
 }
 
@@ -341,8 +389,9 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
 
     if (param.getExpWeights)
     {
-        EXPECT_EQ(isClose(bufferCast<T>(*mPtrExpertWeightsHost), expertWeightsPtr, param.numTokens * param.topK,
-                      "expert weights"),
+        int const totalExpertsPerToken = param.topK + param.numFusedSharedExperts;
+        EXPECT_EQ(isClose(bufferCast<T>(*mPtrExpertWeightsHost), expertWeightsPtr,
+                      param.numTokens * totalExpertsPerToken, "expert weights"),
             true);
     }
     // expert counts aren't always used, but if tokens > 8 * 1024, we are sure they are used
@@ -376,6 +425,8 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     {
         GTEST_SKIP() << "Skip test due to compute capability requirement.";
     }
+    // Set seed to time-based seed
+    resetToTimeBasedSeed();
 
     // Allocate buffers
     allocateBuffers(param);

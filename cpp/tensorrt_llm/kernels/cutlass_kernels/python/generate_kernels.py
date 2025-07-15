@@ -359,7 +359,7 @@ def is_gemm_op_valid_sm100(op):
         # TODO 128x256x256 FP4 compiles but crashes
         # if tile_n % 64 != 0 or tile_n < 128:
         #     return False
-        if tile_n not in [64, 128] or tile_m != 128:
+        if tile_n not in [64, 128, 256] or tile_m != 128:
             return False
 
     # Shapes for fp8 small N shapes
@@ -814,7 +814,7 @@ if __name__ == "__main__":
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
     operations = []
-    operations += generate_sm120_operations(has_arch(120))
+    operations += generate_sm120_operations(has_arch(120) or has_arch(121))
     operations += generate_sm100_operations(has_arch(100))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))

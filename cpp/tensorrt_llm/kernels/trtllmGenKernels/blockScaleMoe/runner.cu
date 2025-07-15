@@ -79,23 +79,17 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
-        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrNumTokensPerExpert = numTokensPerExpert;
         routingData.mPtrExpertWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
         routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
         routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
-        routingData.mAllToAllRouteAct = false;
 
         // input:
-        // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
         routingData.mPtrRoutingBias = routingBias;
         routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
-        // routingData.mPtrIn = args.mInputActs;
         routingData.mNumTokens = numTokens;
-        // routingData.mHiddenDim = args.mHiddenDim;
         routingData.mNumFusedSharedExperts = numFusedSharedExpert;
         routingData.mNumExperts = numExperts;
         routingData.mNumExpertGroups = nGroup;
@@ -145,9 +139,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
-        // routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        // routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
         routingData.mPtrExpertWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;

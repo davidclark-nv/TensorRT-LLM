@@ -1,3 +1,4 @@
+import os
 import random
 from collections.abc import Iterable
 from typing import Dict, List, Optional
@@ -18,6 +19,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
 from ..speculative import get_spec_decoder
+from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
@@ -75,16 +77,15 @@ class KvCacheCreator:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
         else:
-            head_dim = getattr(
-                config,
-                "head_dim",
-                config.hidden_size // config.num_attention_heads,
-            ) * num_key_value_heads // tp_size
+            _head_dim = getattr(config, 'head_dim', None)
+            if not isinstance(_head_dim, int):
+                _head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = _head_dim * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
-        num_hidden_layers = max(
-            len(mapping.pp_layers(config.num_hidden_layers)), 1)
-        mem_per_token *= num_hidden_layers * head_dim
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
@@ -158,10 +159,10 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+                num_extra_tokens_per_seq += spec_cfg.max_draft_len
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.max_draft_len
             num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
@@ -281,8 +282,9 @@ class KvCacheCreator:
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       num_attention_heads)
-        head_dim = getattr(config, "head_dim",
-                           hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
@@ -538,7 +540,7 @@ def create_py_executor_instance(
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
         max_beam_width=executor_config.max_beam_width,
-        max_draft_tokens=spec_config.max_draft_tokens
+        max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
@@ -549,11 +551,11 @@ def create_py_executor_instance(
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
                               *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
-    max_draft_tokens = (0 if executor_config.speculative_config is None else
-                        executor_config.speculative_config.max_draft_tokens)
+    max_draft_len = (0 if executor_config.speculative_config is None else
+                     executor_config.speculative_config.max_draft_len)
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
-        max_draft_tokens=max_draft_tokens,
+        max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
         enable_mixed_sampler=enable_mixed_sampler,
@@ -718,3 +720,45 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
         return 1
 
     return num_experts
+
+
+def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
+    # FIXME: PyTorch only uses the garbage_collection_threshold setting
+    #        if a memory fraction is set, cf.
+    #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
+    logger.debug("Setting PyTorch memory fraction to 1.0")
+    torch.cuda.set_per_process_memory_fraction(1.0)
+
+    # FIXME: As soon as
+    #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
+    #   or a similar API is available, the warning below should be removed
+    #   and the allocator GC threshold be set via the new API instead.
+    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_mem_threshold_advised = (
+        torch.cuda.get_allocator_backend() == "native"
+        and "expandable_segments:True" not in torch_allocator_config)
+    torch_mem_threshold_set = "garbage_collection_threshold:" in torch_allocator_config
+    if torch_mem_threshold_advised and not torch_mem_threshold_set:
+        logger.warning(
+            "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
+            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+
+    # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
+    #       fraction < 1.0 is beneficial, because
+    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L2719
+    #       and
+    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L1240
+    #       lead PyTorch to release all unused memory before hitting the set fraction. This
+    #       still mitigates OOM, although at a higher performance impact, because it
+    #       effectively resets the allocator cache.
+    if not pytorch_backend_config._limit_torch_cuda_mem_fraction:
+        return
+    mem_reserved = torch.cuda.memory_reserved()
+    mem_free, mem_total = torch.cuda.mem_get_info()
+    safety_margin = 32 * 1024**2
+    mem_torch_max = mem_free + mem_reserved - safety_margin
+    mem_torch_fraction = mem_torch_max / mem_total
+    logger.info(
+        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
+    )
+    torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)

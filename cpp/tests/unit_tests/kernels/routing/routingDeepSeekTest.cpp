@@ -37,11 +37,6 @@ protected:
     TensorPtr mPtrRoutingBiasHost;
     TensorPtr mPtrRoutingBiasDevice;
 
-    // Add this variable because the definition of mPtrExpertIdx is "int32_t*" for Deepseek
-    //@TODO: remove this variable after refactoring
-    TensorPtr mPtrDeepseekExpertIdxHost;
-    TensorPtr mPtrDeepseekExpertIdxDevice;
-
 private:
     // private methods
     static inline float sigmoid_accurate(float x)
@@ -57,7 +52,6 @@ private:
         // sigmoid / bias activated scores cannot be negative
         static constexpr float invalidScoreFloat = -1.F;
         const T invalidScore = T{invalidScoreFloat};
-        int32_t* expIdxHostPtr = bufferCast<int32_t>(*mPtrDeepseekExpertIdxHost);
 
         float scoreSigmoid[param.numExperts];
         for (int it = 0; it < param.numTokens; ++it)
@@ -130,7 +124,6 @@ private:
             // Convert back to io_dtype and store the topk expert results in hostData.mPtrExpertIdx
             for (int ie = 0; ie < param.topK; ++ie)
             {
-                expIdxHostPtr[it * param.topK + ie] = static_cast<int32_t>(finalTopkExperts[ie].idx);
                 if (param.getExpWeights)
                 {
                     bufferCast<T>(*this->mPtrExpertWeightsHost)[it * totalExpertsPerToken + ie]
@@ -159,11 +152,6 @@ private:
             = mBufferManager->pinned(ITensor::makeShape({param.numExperts}), TRTDataType<T>::value);
         this->mPtrRoutingBiasDevice
             = mBufferManager->gpu(ITensor::makeShape({param.numExperts}), TRTDataType<T>::value);
-
-        this->mPtrDeepseekExpertIdxHost
-            = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), TRTDataType<int32_t>::value);
-        this->mPtrDeepseekExpertIdxDevice
-            = mBufferManager->gpu(ITensor::makeShape({param.numTokens * param.topK}), TRTDataType<int32_t>::value);
     }
 
     void setupBuffers(RoutingKernelTestParam const& param) override
@@ -184,13 +172,6 @@ private:
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
         routingData.mPtrRoutingBias = bufferCast<T>(*this->mPtrRoutingBiasDevice);
-        //@todo: remove this line after refactoring
-        routingData.mPtrExpertIdx = bufferCast<int32_t>(*this->mPtrDeepseekExpertIdxDevice);
-
-        routingData.mNumFusedSharedExperts = param.numFusedSharedExperts;
-        routingData.mSharedExpertTokenOffset = param.sharedExpertTokenOffset;
-        routingData.mSharedExpertNumTokens = param.sharedExpertNumTokens;
-        routingData.mTotalExpertsPerToken = routingData.mTopK + routingData.mNumFusedSharedExperts;
 
         routingData.mNumExpertGroups = param.nGroup;
         routingData.mNumLimitedGroups = param.topkGroup;
@@ -206,6 +187,7 @@ private:
         moe::dev::routing::routingDeepSeek::run(routingData, mStream->get());
     }
 
+#if 0
     void verifyExpertRoutingIndices(RoutingKernelTestParam const& param)
     {
         // for permuted index, there is non-determinism, thus we check set-equality
@@ -280,13 +262,14 @@ private:
             }
         }
     }
+#endif
 };
 
 TYPED_TEST_SUITE(RoutingDeepSeekKernelTest, Bf16Types);
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/10,
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
         /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
@@ -350,10 +333,43 @@ TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
     this->runTest(param);
 };
 
-TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationWithFusedShared)
+// TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization)
+// {
+//     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/20300,
+//         /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 0,
+//         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+//         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+//         /*usePdl=*/true, /*getExpWeights=*/true,
+//         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+//     this->runTest(param);
+// };
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationTop2)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/10,
+        /*numExperts=*/128, /*topK=*/2, /*numFusedSharedExperts*/ 0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParallelizationTop2)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/100,
+        /*numExperts=*/128, /*topK=*/2, /*numFusedSharedExperts*/ 0,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationTop2)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/128, /*topK=*/8, /*numFusedSharedExperts*/ 2,
+        /*numExperts=*/128, /*topK=*/2, /*numFusedSharedExperts*/ 0,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true,

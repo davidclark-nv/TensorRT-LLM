@@ -929,6 +929,25 @@ void TrtGptModelInflightBatching::storeContextBlocks(std::shared_ptr<LlmRequest>
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void TrtGptModelInflightBatching::storeNewBlock(std::shared_ptr<LlmRequest> const& llmReq)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    // TMJ - Note
+    // Make context blocks reusable immediately after each generation step.
+
+    if (mKvCacheManager)
+    {
+        mKvCacheManager->storeNewBlock(*llmReq);
+    }
+    if (mCrossKvCacheManager)
+    {
+        mCrossKvCacheManager->storeNewBlock(*llmReq);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TrtGptModelInflightBatching::resetIterationStats()
 {
     mLastIterationStatsIFB = IterationStatsIFB{mMicroBatchId};
@@ -964,8 +983,10 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
         {
             TLLM_LOG_WARNING(
-                "CapacityScheduler didn't schedule any requests, probably because of insufficient resources such as KV "
-                "cache, will try wait for KV cache transfer to complete");
+                "CapacityScheduler didn't schedule any requests in iteration %lu, "
+                "probably because of insufficient resources such as KV cache, "
+                "will try wait for KV cache transfer to complete",
+                mIterCounter);
             if (mCacheTransceiver)
             {
                 mCacheTransceiver->checkContextTransferStatus(1);
@@ -1019,6 +1040,10 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
                 setupDecoderStep(currRequests.contextRequests, *mBuffers.at(contextBufferId),
                     mDecoderInputBuffers.at(getFusedBufferId()));
+                // WAR: Sync to ensure that the decoder setup is complete before the context phase starts.
+                // Without this, there may be a race condition between the decoder setup and the context phase
+                // which also leads to spurious test failure in trtGptModelRealDecoderTest.
+                mRuntime->getStream().synchronize();
             }
             else
             {
@@ -1099,6 +1124,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                     }
                     else if (llmReq->isGenerationInProgressState())
                     {
+                        storeNewBlock(llmReq);
                         TLLM_LOG_DEBUG("request with ID %lu forwards a step in decoder gen phase", llmReq->mRequestId);
                     }
                 }
@@ -2412,9 +2438,8 @@ void TrtGptModelInflightBatching::rewindKVCacheBlocks(SizeType32 numSequences)
     tensorrt_llm::runtime::kernels::invokeUpdateKVBlockArrayDraftTokenLocation(
         *mDecoderState->getAcceptedLengthsCumSum(), *mDecoderState->getAcceptedPackedPaths(),
         *runtimeBuffers.sequenceLengthsDevice, pointerArrayPtr, offsetArrayPtr, localNbLayers, numSequences,
-        mRewindInputs.numKvHeads, sizeInBytesPerKVHead, commonRewindLen, rewindLens,
-        *runtimeBuffers.seqSlotRemappingDevice, *runtimeBuffers.sortedSeqSlots, getMaxAttentionWindow(),
-        mRewindInputs.maxBlocksPerSeq, tokensPerBlock, mRewindInputs.isUseOneMoreBlock,
+        mRewindInputs.numKvHeads, sizeInBytesPerKVHead, commonRewindLen, rewindLens, *runtimeBuffers.seqSlots,
+        getMaxAttentionWindow(), mRewindInputs.maxBlocksPerSeq, tokensPerBlock, mRewindInputs.isUseOneMoreBlock,
         mRuntime->getStreamPtr()->get());
 
     sync_check_cuda_error(mRuntime->getStream().get());
