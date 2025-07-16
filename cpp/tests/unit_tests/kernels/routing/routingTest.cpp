@@ -298,26 +298,6 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
         auto localExpertIdx = ie - param.localExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
             && (localExpertIdx & param.localExpertsStrideLog2) == 0;
-#if 0
-        for (int it = 0; it < param.numTokens * param.topK; ++it)
-        {
-            if (expIdxHostPtr[it].idx == ie)
-            {
-                int const permIdx = isLocalExpert ? expIdxToPermHostptr[it] : int32_t{-1};
-                permutedIdx.insert(permIdx);
-                if (isLocalExpert)
-                {
-                    tokenIdx.insert(it / param.topK);
-                }
-                int const permIdxTest = hostExpToPermTest[it];
-                permutedIdxTest.insert(permIdxTest);
-                if (isLocalExpert)
-                {
-                    tokenIdxTest.insert(hostPermToTokTest[permIdxTest]);
-                }
-            }
-        }
-#else
         // Loop over the "routed" expanded indices, skipping any indices that would correspond to a shared expert
         for (int it = 0; it < param.numTokens; ++it)
         {
@@ -343,8 +323,6 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
                 }
             }
         }
-
-#endif
         EXPECT_EQ(checkSetEqual(ie, permutedIdx, permutedIdxTest, "permuted idx"), true);
         EXPECT_EQ(checkSetEqual(ie, tokenIdx, tokenIdxTest, "token idx"), true);
     }
