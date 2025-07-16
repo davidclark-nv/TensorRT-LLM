@@ -130,6 +130,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         {
             TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
         }
+        int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
+
         moe::dev::routing::routingLlama4::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
@@ -158,6 +160,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mNumExpertGroups = nGroup;
         // routingData.mNumLimitedGroups =topkGroup;
         routingData.mTopK = topK;
+        routingData.mNumFusedSharedExperts = numFusedSharedExpert;
+        routingData.mTotalExpertsPerToken = totalExpertsPerToken;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
@@ -171,6 +175,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         TLLM_CHECK_WITH_INFO(
             numFusedSharedExpert == 0, "Renormalize routing method does not support fusing shared expert");
+        int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
         moe::dev::routing::routingRenormalize::Data routingData;
 
         //
@@ -208,6 +213,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumTokens = numTokens;
         routingData.mNumExperts = numExperts;
         routingData.mTopK = topK;
+        routingData.mTotalExpertsPerToken = totalExpertsPerToken;
+        routingData.mNumFusedSharedExperts = numFusedSharedExpert;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
